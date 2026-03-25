@@ -13,6 +13,7 @@ runs/
 *.onnx
 # Model weights
 *.pt
+models/
 
 # Datasets and labels/images exports
 Ambulance.v1i.yolov8/
