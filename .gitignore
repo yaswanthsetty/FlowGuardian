@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.venv-1/
+yolov8env/
+
+# YOLO / ML artifacts
+runs/
+*.onnx
+# Model weights
+*.pt
+
+# Datasets and labels/images exports
+Ambulance.v1i.yolov8/
+train/
+valid/
+test/
+images/
+labels/
+
+# Local artifacts
+image.png
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/

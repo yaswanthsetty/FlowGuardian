@@ -1,0 +1,15 @@
+# Dataset configuration file
+path: C:\Users\bsvps\OneDrive\Desktop\Final Project IoT  # dataset root
+train: images/train  # train images (relative to 'path')
+val: images/val      # val images (relative to 'path')
+test: images/test    # test images (optional)
+
+# Number of classes
+nc: 1  # change to your number of classes
+
+# Class names
+names:
+  0: 'object_name'  # replace with your actual class name
+  # Add more classes if needed:
+  # 1: 'class2'
+  # 2: 'class3'
