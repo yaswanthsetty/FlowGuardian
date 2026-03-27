@@ -1,243 +1,166 @@
-# Smart Traffic Control System (Edge AI + IoT)
+# Smart Traffic Control System (Hybrid AI + IoT)
 
-## Project Description
-This project is a real-time smart traffic control system that combines computer vision and IoT control.
+## Overview
+This project controls a traffic junction using multiple camera feeds, YOLO models, a hybrid scheduler, and Raspberry Pi socket-based signal execution.
 
-It uses:
-- A YOLO model for vehicle and ambulance detection.
-- A second YOLO model for accident detection.
-- Live IP webcam streams as camera inputs.
-- Lane scheduling logic with priority handling.
-- TCP socket communication to send lane timing commands to a Raspberry Pi traffic controller.
+Core objective:
+- NORMAL mode by default with fixed timings.
+- OVERRIDE mode only when ambulance is confirmed or lane density is high.
+- Accident model is monitoring and alert only (no direct timing override).
 
-Current lane priority order is:
-1. Accident
-2. Ambulance
-3. Traffic density
+## Model Usage
+- new.pt
+  Role: vehicle counting for density estimation.
+  Used by: detection/yolo_detector.py
 
-The system is built as a modular Python application for easier maintenance and feature expansion.
+- models/bestamb.pt
+  Role: ambulance detection only.
+  Used by: detection/ambulance_detector.py
 
-## Key Features
-- Real-time multi-lane camera ingestion using OpenCV.
-- Vehicle counting per lane using YOLO detections.
-- Ambulance detection with confirmation timing logic.
-- Accident detection using a dedicated second YOLO model.
-- Lane mapping from accident bounding boxes.
-- Temporal accident confirmation to reduce false positives.
-- Accident debounce lock for stable behavior during demos.
-- Priority-aware scheduler for signal planning.
-- Persistent TCP socket client with retry support.
-- Structured logging for runtime visibility.
+- models/accident_model.pt
+  Role: accident monitoring and alert only.
+  Used by: logic/accident_ml.py
 
-## System Architecture
-The runtime is organized into clear modules:
+## Hybrid Control Modes
+- NORMAL
+  - Lane order: 1..N
+  - Green/yellow durations from DEFAULT_GREEN_DURATIONS and DEFAULT_YELLOW_DURATIONS
+  - Reason: default
 
+- OVERRIDE
+  Triggered when:
+  - Ambulance is confirmed after temporal validation (5-10 seconds), or
+  - max(vehicle_count) > DENSITY_OVERRIDE_THRESHOLD
+
+  Behavior:
+  - Ambulance lane gets highest priority when active.
+  - Otherwise lanes are sorted by density.
+  - Green time is distributed proportionally using TOTAL_OVERRIDE_CYCLE_TIME.
+  - Reason: ambulance or density
+
+## Runtime Workflow
+Camera -> Vehicle model -> Ambulance model -> Accident model -> Scheduler -> Socket -> Raspberry Pi -> Traffic lights
+
+Detailed flow:
+1. main.py reads config from .env via config.py.
+2. For each lane camera:
+   - Vehicle model updates lane counts.
+   - Dedicated ambulance model detects ambulance candidates.
+   - Scheduler applies per-lane ambulance temporal validation.
+   - Accident model runs periodically for monitoring overlays/alerts only.
+3. Scheduler returns mode + lane order + timings.
+4. Controller sends timing string to Raspberry Pi over TCP.
+5. Optional cloud payload is sent on configured interval.
+
+## Raspberry Pi Communication
+Current control message format from runtime:
+- LANE1:20:5,LANE2:20:5,LANE3:20:5,LANE4:20:5
+
+Each segment means:
+- LANE<id>:<green_seconds>:<yellow_seconds>
+
+Compatibility:
+- Raspberry Pi parser in raspberry_pi_server.py also accepts LANE1:20 format (yellow defaults to 5).
+
+## Multi-Lane Support
+The system supports 3-lane, 4-lane, or N-lane setups.
+
+Requirements:
+- Set CAMERA_URLS with exactly one URL per lane.
+- Provide default timing lists (they are auto-expanded by scheduler if shorter).
+- For Raspberry Pi GPIO control, map lane pins in raspberry_pi_server.py for the lanes you physically use.
+
+## Project Structure
 - main.py
-  Orchestrates camera capture, ML inference loops, state updates, overlays, scheduler calls, and socket dispatch.
-
 - config.py
-  Loads environment-driven runtime settings into a Settings object.
-
-- detection/yolo_detector.py
-  Runs primary YOLO inference for vehicle counting and ambulance detection.
-
-- logic/accident_ml.py
-  Runs accident model inference and returns normalized accident outputs.
-
-- logic/traffic_scheduler.py
-  Computes lane order and timings using Accident > Ambulance > Density priority.
-
-- communication/socket_client.py
-  Manages persistent TCP communication and send retries to Raspberry Pi.
-
-- utils/logger.py
-  Provides structured logger setup.
-
-## Folder Structure
-High-level structure (focused on core runtime and pipeline files):
-
-- main.py
-- config.py
-- requirements.txt
-- data.yaml
-- train.py
-- organize_dataset.py
 - detection/
-  - __init__.py
   - yolo_detector.py
+  - ambulance_detector.py
 - logic/
-  - __init__.py
   - traffic_scheduler.py
   - accident_ml.py
 - communication/
-  - __init__.py
   - socket_client.py
-- utils/
-  - __init__.py
-  - logger.py
-- models/
-  - accident_model.pt
-- best.pt
+  - cloud_sync.py
+- raspberry_pi_server.py
+- .env.example
+- requirements.txt
 
-Repository also contains dataset folders, training artifacts, and older experimental files.
+## Setup
+### 1. Install dependencies
+```powershell
+pip install -r requirements.txt
+```
 
-## Tech Stack
-- Python
-- Ultralytics YOLO
-- OpenCV
-- Socket programming (TCP)
-- Threading (Python stdlib)
+### 2. Prepare environment file
+```powershell
+copy .env.example .env
+```
 
-## Model Details
-Primary model:
-- File: best.pt
-- Used by: detection/yolo_detector.py
-- Role: vehicle and ambulance detection
+### 3. Configure .env
+Important keys:
+- MODEL_PATH=new.pt
+- AMBULANCE_MODEL_PATH=models/bestamb.pt
+- ACCIDENT_MODEL_PATH=models/accident_model.pt
+- CAMERA_URLS=http://cam1/video,http://cam2/video,http://cam3/video
+- PI_HOST=<raspberry_pi_ip>
+- PI_PORT=7000
+- DEFAULT_GREEN_DURATIONS=20,20,20,20
+- DEFAULT_YELLOW_DURATIONS=5,5,5,5
+- DENSITY_OVERRIDE_THRESHOLD=15
+- TOTAL_OVERRIDE_CYCLE_TIME=80
+- AMBULANCE_CONFIRM_SECONDS=8
+- CLOUD_SYNC_ENABLED=0 or 1
 
-Accident model:
-- File: models/accident_model.pt
-- Used by: logic/accident_ml.py
-- Role: accident detection
+### 4. Place model files
+- new.pt at project root (or set MODEL_PATH)
+- bestamb.pt under models/ (or set AMBULANCE_MODEL_PATH)
+- accident_model.pt under models/
 
-## IoT Integration (Raspberry Pi)
-The application sends traffic signal plans over TCP to a Raspberry Pi endpoint.
+### 5. Run controller
+```powershell
+python main.py
+```
 
-Communication behavior:
-- Persistent socket connection.
-- Reconnect and resend on failure.
-- Retry loop before reporting send failure.
+### 6. Run Raspberry Pi server
+On Raspberry Pi:
+```bash
+python3 raspberry_pi_server.py
+```
 
-Typical message format sent by scheduler:
-- LANE1:20:5,LANE2:15:5,LANE3:10:5
+## Cloud Sync Payload (optional)
+If CLOUD_SYNC_ENABLED=1, payload includes:
+- mode
+- reason
+- junction_id
+- lane_order
+- lanes[] with green/yellow/vehicle_count
+- ambulance_lane
+- accident_alert {active, lane, confidence}
+- timestamp
 
-Accident and ambulance event messages are also sent when detected and confirmed.
+## Troubleshooting
+- Camera not opening:
+  - Check CAMERA_URLS reachability and stream availability.
+  - Verify FRAME_WIDTH/FRAME_HEIGHT are supported by the stream.
 
-## How It Works
-1. Start app and load runtime settings.
-2. Open camera streams.
-3. For each frame:
-   - Run vehicle and ambulance detection.
-   - Update lane counts and ambulance state.
-   - Run accident model every configured N frames.
-   - Map accident boxes to lane IDs.
-   - Apply temporal confirmation and lock logic.
-4. Build lane signal plan via scheduler.
-5. Send signal plan to Raspberry Pi.
-6. Show live annotated visualization windows.
+- Socket send failures:
+  - Ensure Raspberry Pi server is running on PI_HOST:PI_PORT.
+  - Check firewall and local network routing.
 
-## System Workflow (End-to-End)
-Camera stream
--> frame capture
--> primary YOLO detection (vehicles + ambulance)
--> accident YOLO detection (periodic)
--> accident box to lane mapping
--> temporal validation and debounce lock
--> scheduler computes lane priority and timings
--> socket client sends commands to Raspberry Pi
--> Raspberry Pi drives traffic light sequence
+- Model load errors:
+  - Verify .pt files exist at configured paths.
+  - Ensure ultralytics is installed in the active environment.
 
-## Quick Start Guide
-1. Install dependencies.
-2. Copy .env.example to .env and update values.
-3. Configure IP webcam URLs, model paths, and Raspberry Pi endpoint in .env.
-4. Run main.py.
-5. Observe terminal logs and OpenCV windows.
+- No ambulance override:
+  - Confirm bestamb.pt has an ambulance class label.
+  - Increase AMBULANCE_CONFIRM_SECONDS only if needed.
+  - Lower AMBULANCE_CONF_THRESHOLD if detections are too strict.
 
-Expected output:
-- Live lane windows with vehicle counts.
-- Ambulance and accident status overlays.
-- Signal plan logs.
-- Command sends to Raspberry Pi.
+- GPIO issues on Raspberry Pi:
+  - Update lane pin mapping in raspberry_pi_server.py.
+  - Run with proper permissions when using RPi.GPIO.
 
-## Setup Instructions
-### Prerequisites
-- Python 3.10 or newer
-- IP webcams reachable from the machine
-- Raspberry Pi server listening for TCP commands
-- YOLO model files present at configured paths
-
-### Installation
-1. Create or activate virtual environment.
-2. Install dependencies:
-   pip install -r requirements.txt
-3. Create environment file:
-  copy .env.example .env
-
-### Data Configuration
-- data.yaml defines the YOLO training dataset layout.
-- Current classes in data.yaml are set to a single class (Ambulance).
-
-## Running the Project
-Run runtime:
-- python main.py
-
-Legacy entry (still available):
-- python traffic_density_yolo.py
-
-Run training pipeline:
-- python train.py --model yolov8n.pt --data data.yaml --epochs 50
-
-Organize dataset into canonical format:
-- python organize_dataset.py --base . --keep-legacy
-
-## Configuration (Environment Variables)
-The runtime reads these values in config.py:
-
-Primary detection:
-- MODEL_PATH
-
-Accident detection:
-- ACCIDENT_MODEL_PATH
-- ACCIDENT_CONF_THRESHOLD
-- ACCIDENT_FRAME_SKIP
-
-Cameras:
-- CAMERA_URLS (comma-separated)
-- FRAME_WIDTH
-- FRAME_HEIGHT
-- CAMERA_RETRY_SECONDS
-
-Scheduler and timing:
-- GREEN_DURATIONS (comma-separated)
-- YELLOW_DURATIONS (comma-separated)
-- AMBULANCE_CONFIRM_SECONDS
-- INITIAL_WAIT_SECONDS
-
-Raspberry Pi communication:
-- PI_HOST
-- PI_PORT
-- SOCKET_CONNECT_TIMEOUT
-- SOCKET_SEND_TIMEOUT
-- SOCKET_RETRY_SECONDS
-
-Visualization:
-- SHOW_WINDOWS (1 or 0)
-
-## Demo Explanation
-During a demo, users will see:
-- Live video feed per lane.
-- Lane divider overlays.
-- Vehicle count overlay text.
-- Ambulance status overlay when detected.
-- Accident bounding boxes and accident status overlays.
-- Stable accident behavior due to temporal confirmation and lock duration.
-- Continuous signal plan logs and socket send attempts.
-
-## Requirements Check
-The current requirements.txt aligns with imported external packages in core runtime and training files:
-- ultralytics
-- opencv-python
-
-Other imports are from Python standard library.
-
-## Future Improvements
-- Add authenticated message protocol for Raspberry Pi communication.
-- Add unit and integration tests for scheduler and accident state logic.
-- Add health checks and telemetry export.
-- Add camera stream watchdog metrics and reconnection dashboards.
-- Add model confidence calibration utilities.
-- Add optional ONNX export/inference path for edge optimization.
-
-## Contributors
-- Your Name Here
-- Team Name Here
+## Notes
+- Accident detection is intentionally alert-only and does not alter signal timings.
+- Socket retry logic is handled by communication/socket_client.py so temporary network issues do not crash runtime.

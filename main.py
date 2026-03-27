@@ -5,8 +5,10 @@ from typing import Any, List
 
 import cv2
 
+from communication.cloud_sync import CloudSyncClient
 from communication.socket_client import PersistentSocketClient
 from config import Settings, load_settings
+from detection.ambulance_detector import AmbulanceDetector
 from detection.yolo_detector import YoloTrafficDetector
 from logic.accident_ml import AccidentDetector
 from logic.traffic_scheduler import TrafficScheduler
@@ -39,15 +41,21 @@ class TrafficControllerApp:
         self.logger = build_logger()
 
         self.detector = YoloTrafficDetector(settings.model_path)
+        self.ambulance_detector = AmbulanceDetector(
+            model_path=settings.ambulance_model_path,
+            conf_threshold=settings.ambulance_conf_threshold,
+        )
         self.accident_detector = AccidentDetector(
             model_path=settings.accident_model_path,
             conf_threshold=settings.accident_conf_threshold,
         )
         self.scheduler = TrafficScheduler(
             lane_count=len(settings.camera_urls),
-            green_durations=settings.green_durations,
-            yellow_durations=settings.yellow_durations,
+            default_green_durations=settings.default_green_durations,
+            default_yellow_durations=settings.default_yellow_durations,
             ambulance_confirm_seconds=settings.ambulance_confirm_seconds,
+            density_override_threshold=settings.density_override_threshold,
+            total_override_cycle_time=settings.total_override_cycle_time,
         )
         self.socket_client = PersistentSocketClient(
             host=settings.pi_host,
@@ -55,6 +63,13 @@ class TrafficControllerApp:
             connect_timeout=settings.connect_timeout_seconds,
             send_timeout=settings.send_timeout_seconds,
             retry_seconds=settings.socket_retry_seconds,
+            logger=self.logger,
+        )
+        self.cloud_sync = CloudSyncClient(
+            enabled=settings.cloud_sync_enabled,
+            api_url=settings.cloud_api_url,
+            interval_seconds=settings.cloud_sync_interval_seconds,
+            junction_id=settings.junction_id,
             logger=self.logger,
         )
 
@@ -74,6 +89,10 @@ class TrafficControllerApp:
         # Visualization state for each camera frame.
         self.latest_accident_boxes: List[list[tuple[int, int, int, int]]] = [[] for _ in self.cameras]
         self.latest_accident_confidence: List[float] = [0.0] * len(self.cameras)
+        self.latest_vehicle_counts: List[int] = [0] * len(self.cameras)
+        self.latest_ambulance_boxes: List[list[tuple[int, int, int, int]]] = [[] for _ in self.cameras]
+        self.latest_ambulance_confidence: List[float] = [0.0] * len(self.cameras)
+        self.latest_ambulance_detected: List[bool] = [False] * len(self.cameras)
 
         self.accident_active = False
         self.accident_lane: int | None = None
@@ -130,7 +149,6 @@ class TrafficControllerApp:
         self.locked_accident_confidence = confidence
 
         self.logger.warning(f"🚨 Accident detected in lane {selected_lane} (confidence: {confidence:.2f})")
-        self.socket_client.send_with_retry(f"ACCIDENT:LANE{selected_lane}")
 
     def _draw_lane_dividers(self, frame: Any) -> None:
         lane_count = max(len(self.cameras), 1)
@@ -154,6 +172,22 @@ class TrafficControllerApp:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 165, 255),
+                2,
+            )
+
+    def _draw_ambulance_overlay(self, frame: Any, camera_idx: int) -> None:
+        for x1, y1, x2, y2 in self.latest_ambulance_boxes[camera_idx]:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.putText(frame, "AMBULANCE", (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+        if self.latest_ambulance_detected[camera_idx]:
+            cv2.putText(
+                frame,
+                f"AMBULANCE CANDIDATE (conf: {self.latest_ambulance_confidence[camera_idx]:.2f})",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 0, 0),
                 2,
             )
 
@@ -207,11 +241,27 @@ class TrafficControllerApp:
                         self.logger.exception(f"Lane {idx + 1}: inference error: {exc}")
                         continue
 
+                    ambulance_detected = self.latest_ambulance_detected[idx]
+                    if self.frame_counts[idx] % self.settings.ambulance_frame_skip == 0:
+                        try:
+                            ambulance_data = self.ambulance_detector.detect(frame)
+                            ambulance_detected = bool(ambulance_data["detected"])
+                            self.latest_ambulance_detected[idx] = ambulance_detected
+                            self.latest_ambulance_confidence[idx] = float(ambulance_data["confidence"])
+                            self.latest_ambulance_boxes[idx] = ambulance_data["boxes"]
+                        except Exception as exc:
+                            self.logger.exception(f"Lane {idx + 1}: ambulance detection failure: {exc}")
+                            ambulance_detected = False
+                            self.latest_ambulance_detected[idx] = False
+                            self.latest_ambulance_confidence[idx] = 0.0
+                            self.latest_ambulance_boxes[idx] = []
+
                     confirmed_lane = self.scheduler.update_lane_detection(
                         lane_index=idx,
                         vehicle_count=result.vehicle_count,
-                        ambulance_detected=result.ambulance_detected,
+                        ambulance_detected=ambulance_detected,
                     )
+                    self.latest_vehicle_counts[idx] = result.vehicle_count
 
                     if confirmed_lane is not None:
                         self.logger.warning(f"Ambulance confirmed in lane {confirmed_lane}")
@@ -275,20 +325,10 @@ class TrafficControllerApp:
                             (0, 255, 255),
                             2,
                         )
-                        if result.ambulance_detected:
-                            cv2.putText(
-                                annotated,
-                                "AMBULANCE DETECTED",
-                                (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.8,
-                                (0, 0, 255),
-                                2,
-                            )
                         if self.accident_active and self.accident_lane is not None:
                             cv2.putText(
                                 annotated,
-                                f"ACCIDENT PRIORITY LANE {self.accident_lane}",
+                                f"ACCIDENT ALERT LANE {self.accident_lane}",
                                 (10, 90),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.8,
@@ -297,6 +337,7 @@ class TrafficControllerApp:
                             )
 
                         self._draw_lane_dividers(annotated)
+                        self._draw_ambulance_overlay(annotated, idx)
                         self._draw_accident_overlay(annotated, idx)
 
                         cv2.imshow(f"Lane {idx + 1}", annotated)
@@ -318,18 +359,33 @@ class TrafficControllerApp:
         try:
             while self.running:
                 with self.lock:
-                    order = self.scheduler.next_cycle(
-                        accident_flag=self.accident_active,
+                    schedule = self.scheduler.next_cycle()
+                    message = self.scheduler.to_wire_message(schedule)
+                    vehicle_counts = self.latest_vehicle_counts[:]
+                    ambulance_lane = self.scheduler.ambulance_lane if self.scheduler.ambulance_active else None
+                    accident_confidence = max(self.latest_accident_confidence) if self.latest_accident_confidence else 0.0
+
+                if self.cloud_sync.should_sync():
+                    payload = self.cloud_sync.build_payload(
+                        mode=schedule.mode,
+                        reason=schedule.reason,
+                        lane_order=schedule.lane_order,
+                        green_times=schedule.green_times,
+                        yellow_times=schedule.yellow_times,
+                        vehicle_counts=vehicle_counts,
+                        ambulance_lane=ambulance_lane,
+                        accident_active=self.accident_active,
                         accident_lane=self.accident_lane,
+                        accident_confidence=accident_confidence,
                     )
-                    message = self.scheduler.to_wire_message(order)
+                    self.cloud_sync.sync(payload)
 
                 self.logger.info(f"Signal plan: {message}")
                 sent = self.socket_client.send_with_retry(message)
                 if not sent:
                     self.logger.error("Failed to send signal plan to Raspberry Pi")
 
-                sleep_for = self.scheduler.cycle_duration(order)
+                sleep_for = self.scheduler.cycle_duration(schedule)
                 time.sleep(max(sleep_for, 1))
 
         except KeyboardInterrupt:

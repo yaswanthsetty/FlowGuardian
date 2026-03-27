@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 
 @dataclass
@@ -10,18 +10,38 @@ class LaneSignal:
     yellow_seconds: int
 
 
+@dataclass
+class ScheduleResult:
+    mode: str
+    lane_order: List[int]
+    green_times: List[int]
+    yellow_times: List[int]
+    reason: str
+
+    def as_lane_signals(self) -> List[LaneSignal]:
+        return [
+            LaneSignal(lane=lane, green_seconds=green, yellow_seconds=yellow)
+            for lane, green, yellow in zip(self.lane_order, self.green_times, self.yellow_times)
+        ]
+
+
 class TrafficScheduler:
     def __init__(
         self,
         lane_count: int,
-        green_durations: List[int],
-        yellow_durations: List[int],
+        default_green_durations: List[int],
+        default_yellow_durations: List[int],
         ambulance_confirm_seconds: int,
+        density_override_threshold: int,
+        total_override_cycle_time: int,
     ):
         self.lane_count = lane_count
-        self.green_durations = self._expand(green_durations, lane_count, 10)
-        self.yellow_durations = self._expand(yellow_durations, lane_count, 5)
+        self.default_green_durations = self._expand(default_green_durations, lane_count, 20)
+        self.default_yellow_durations = self._expand(default_yellow_durations, lane_count, 5)
         self.ambulance_confirm_seconds = ambulance_confirm_seconds
+        self.density_override_threshold = density_override_threshold
+        self.total_override_cycle_time = total_override_cycle_time
+        self.min_override_green = 5
 
         self.lane_counts = [0] * lane_count
         self.ambulance_detection_times = [0.0] * lane_count
@@ -58,90 +78,84 @@ class TrafficScheduler:
 
         return None
 
-    def _normal_priority(self) -> List[LaneSignal]:
+    def _normal_priority(self) -> ScheduleResult:
+        lane_order = list(range(1, self.lane_count + 1))
+        green_times = self.default_green_durations[:]
+        yellow_times = self.default_yellow_durations[:]
+        return ScheduleResult(
+            mode="NORMAL",
+            lane_order=lane_order,
+            green_times=green_times,
+            yellow_times=yellow_times,
+            reason="default",
+        )
+
+    def _build_override_schedule(self, reason: str) -> ScheduleResult:
+        prioritized_lanes: List[int] = []
+
+        if self.ambulance_active and self.ambulance_lane is not None:
+            prioritized_lanes.append(self.ambulance_lane)
+
         lane_order = sorted(
             enumerate(self.lane_counts, start=1),
             key=lambda x: x[1],
             reverse=True,
         )
-        signals: List[LaneSignal] = []
-        for rank, (lane, _) in enumerate(lane_order):
-            signals.append(
-                LaneSignal(
-                    lane=lane,
-                    green_seconds=self.green_durations[rank],
-                    yellow_seconds=self.yellow_durations[rank],
-                )
-            )
-        return signals
+        for lane, _ in lane_order:
+            if lane not in prioritized_lanes:
+                prioritized_lanes.append(lane)
 
-    def _accident_priority(self, accident_lane: int) -> List[LaneSignal]:
-        normal_lanes: List[Tuple[int, int]] = [
-            (idx + 1, count)
-            for idx, count in enumerate(self.lane_counts)
-            if (idx + 1) != accident_lane
-        ]
-        normal_lanes.sort(key=lambda x: x[1], reverse=True)
+        green_times = self._dynamic_green_times(prioritized_lanes)
+        yellow_times = self.default_yellow_durations[:]
 
-        order = [
-            LaneSignal(
-                lane=accident_lane,
-                green_seconds=self.green_durations[0],
-                yellow_seconds=self.yellow_durations[0],
-            )
-        ]
+        return ScheduleResult(
+            mode="OVERRIDE",
+            lane_order=prioritized_lanes,
+            green_times=green_times,
+            yellow_times=yellow_times,
+            reason=reason,
+        )
 
-        for idx, (lane, _) in enumerate(normal_lanes, start=1):
-            order.append(
-                LaneSignal(
-                    lane=lane,
-                    green_seconds=self.green_durations[idx],
-                    yellow_seconds=self.yellow_durations[idx],
-                )
-            )
+    def _dynamic_green_times(self, lane_order: List[int]) -> List[int]:
+        ordered_counts = [self.lane_counts[lane - 1] for lane in lane_order]
+        total_count = max(sum(ordered_counts), 1)
+        lane_total = len(lane_order)
 
-        return order
+        if self.total_override_cycle_time <= lane_total * self.min_override_green:
+            return [self.min_override_green] * lane_total
 
-    def next_cycle(self, accident_flag: bool = False, accident_lane: Optional[int] = None) -> List[LaneSignal]:
-        if accident_flag and accident_lane is not None and 1 <= accident_lane <= self.lane_count:
-            return self._accident_priority(accident_lane)
+        available = self.total_override_cycle_time - (lane_total * self.min_override_green)
+        proportional_extras = [int((count / total_count) * available) for count in ordered_counts]
+        extras_sum = sum(proportional_extras)
 
-        if not self.ambulance_active or self.ambulance_lane is None:
-            return self._normal_priority()
+        # Distribute remaining seconds to the busiest lanes for stable totals.
+        remaining = available - extras_sum
+        busy_rank = sorted(range(lane_total), key=lambda idx: ordered_counts[idx], reverse=True)
+        for idx in busy_rank:
+            if remaining <= 0:
+                break
+            proportional_extras[idx] += 1
+            remaining -= 1
 
-        normal_lanes: List[Tuple[int, int]] = [
-            (idx + 1, count)
-            for idx, count in enumerate(self.lane_counts)
-            if (idx + 1) != self.ambulance_lane
-        ]
-        normal_lanes.sort(key=lambda x: x[1], reverse=True)
+        return [self.min_override_green + extra for extra in proportional_extras]
 
-        order = [
-            LaneSignal(
-                lane=self.ambulance_lane,
-                green_seconds=self.green_durations[0],
-                yellow_seconds=self.yellow_durations[0],
-            )
-        ]
+    def next_cycle(self) -> ScheduleResult:
+        if self.ambulance_active and self.ambulance_lane is not None:
+            return self._build_override_schedule(reason="ambulance")
 
-        for idx, (lane, _) in enumerate(normal_lanes, start=1):
-            order.append(
-                LaneSignal(
-                    lane=lane,
-                    green_seconds=self.green_durations[idx],
-                    yellow_seconds=self.yellow_durations[idx],
-                )
-            )
+        if max(self.lane_counts) > self.density_override_threshold:
+            return self._build_override_schedule(reason="density")
 
-        return order
+        return self._normal_priority()
 
     @staticmethod
-    def to_wire_message(order: List[LaneSignal]) -> str:
+    def to_wire_message(schedule: ScheduleResult) -> str:
+        order = schedule.as_lane_signals()
         return ",".join(
             f"LANE{signal.lane}:{signal.green_seconds}:{signal.yellow_seconds}"
             for signal in order
         )
 
     @staticmethod
-    def cycle_duration(order: List[LaneSignal]) -> int:
-        return sum(signal.green_seconds + signal.yellow_seconds for signal in order)
+    def cycle_duration(schedule: ScheduleResult) -> int:
+        return sum(green + yellow for green, yellow in zip(schedule.green_times, schedule.yellow_times))
