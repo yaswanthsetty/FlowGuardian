@@ -41,9 +41,8 @@ def _load_dotenv(dotenv_path: Path) -> None:
 @dataclass
 class Settings:
     model_path: str
-    ambulance_model_path: str
-    ambulance_conf_threshold: float
-    ambulance_frame_skip: int
+    device: str
+    frame_skip: int
     accident_model_path: str
     accident_conf_threshold: float
     accident_frame_skip: int
@@ -70,9 +69,6 @@ class Settings:
 
 
 DEFAULT_CAMERA = "http://127.0.0.1:8080/video"
-AMBULANCE_MODEL_PATH = "models/bestamb.pt"
-AMBULANCE_CONF_THRESHOLD = 0.5
-AMBULANCE_FRAME_SKIP = 2
 ACCIDENT_MODEL_PATH = "models/accident_model.pt"
 ACCIDENT_CONF_THRESHOLD = 0.6
 ACCIDENT_FRAME_SKIP = 5
@@ -83,7 +79,7 @@ DEFAULT_YELLOW_DURATIONS = "5,5,5,5"
 def load_settings() -> Settings:
     project_root = Path(__file__).resolve().parent
     _load_dotenv(project_root / ".env")
-    model_path = os.getenv("MODEL_PATH", str(project_root / "new.pt"))
+    model_path = os.getenv("MODEL_PATH", str(project_root / "models" / "new.pt"))
 
     camera_urls_raw = os.getenv("CAMERA_URLS", DEFAULT_CAMERA)
     camera_urls = _split_csv(camera_urls_raw)
@@ -99,9 +95,8 @@ def load_settings() -> Settings:
 
     return Settings(
         model_path=model_path,
-        ambulance_model_path=os.getenv("AMBULANCE_MODEL_PATH", str(project_root / AMBULANCE_MODEL_PATH)),
-        ambulance_conf_threshold=float(os.getenv("AMBULANCE_CONF_THRESHOLD", str(AMBULANCE_CONF_THRESHOLD))),
-        ambulance_frame_skip=max(1, int(os.getenv("AMBULANCE_FRAME_SKIP", str(AMBULANCE_FRAME_SKIP)))),
+        device=os.getenv("DEVICE", "auto"),
+        frame_skip=max(1, int(os.getenv("FRAME_SKIP", "3"))),
         accident_model_path=os.getenv("ACCIDENT_MODEL_PATH", str(project_root / ACCIDENT_MODEL_PATH)),
         accident_conf_threshold=float(os.getenv("ACCIDENT_CONF_THRESHOLD", str(ACCIDENT_CONF_THRESHOLD))),
         accident_frame_skip=max(1, int(os.getenv("ACCIDENT_FRAME_SKIP", str(ACCIDENT_FRAME_SKIP)))),

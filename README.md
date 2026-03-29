@@ -10,12 +10,8 @@ Core objective:
 
 ## Model Usage
 - new.pt
-  Role: vehicle counting for density estimation.
+  Role: vehicle counting and ambulance detection.
   Used by: detection/yolo_detector.py
-
-- models/bestamb.pt
-  Role: ambulance detection only.
-  Used by: detection/ambulance_detector.py
 
 - models/accident_model.pt
   Role: accident monitoring and alert only.
@@ -39,13 +35,14 @@ Core objective:
   - Reason: ambulance or density
 
 ## Runtime Workflow
-Camera -> Vehicle model -> Ambulance model -> Accident model -> Scheduler -> Socket -> Raspberry Pi -> Traffic lights
+Camera -> new.pt inference -> Scheduler -> Socket -> Raspberry Pi -> Traffic lights
 
 Detailed flow:
 1. main.py reads config from .env via config.py.
 2. For each lane camera:
-   - Vehicle model updates lane counts.
-   - Dedicated ambulance model detects ambulance candidates.
+  - Single model (new.pt) detects vehicles and ambulance.
+  - Primary detection runs with FRAME_SKIP to reduce load.
+  - Device is auto-selected: CUDA when available, CPU fallback otherwise.
    - Scheduler applies per-lane ambulance temporal validation.
    - Accident model runs periodically for monitoring overlays/alerts only.
 3. Scheduler returns mode + lane order + timings.
@@ -75,7 +72,6 @@ Requirements:
 - config.py
 - detection/
   - yolo_detector.py
-  - ambulance_detector.py
 - logic/
   - traffic_scheduler.py
   - accident_ml.py
@@ -99,8 +95,9 @@ copy .env.example .env
 
 ### 3. Configure .env
 Important keys:
-- MODEL_PATH=new.pt
-- AMBULANCE_MODEL_PATH=models/bestamb.pt
+- MODEL_PATH=models/new.pt
+- DEVICE=auto
+- FRAME_SKIP=3
 - ACCIDENT_MODEL_PATH=models/accident_model.pt
 - CAMERA_URLS=http://cam1/video,http://cam2/video,http://cam3/video
 - PI_HOST=<raspberry_pi_ip>
@@ -113,8 +110,7 @@ Important keys:
 - CLOUD_SYNC_ENABLED=0 or 1
 
 ### 4. Place model files
-- new.pt at project root (or set MODEL_PATH)
-- bestamb.pt under models/ (or set AMBULANCE_MODEL_PATH)
+- new.pt under models/ (or set MODEL_PATH)
 - accident_model.pt under models/
 
 ### 5. Run controller
@@ -139,6 +135,13 @@ If CLOUD_SYNC_ENABLED=1, payload includes:
 - accident_alert {active, lane, confidence}
 - timestamp
 
+## Performance Optimizations
+- GPU acceleration is used automatically when CUDA is available.
+- CPU fallback is automatic when CUDA is not available.
+- FRAME_SKIP controls how often primary YOLO inference runs (lower is more responsive, higher is lighter).
+- Accident inference has a separate ACCIDENT_FRAME_SKIP control.
+- Camera buffers are minimized to keep live streams smooth.
+
 ## Troubleshooting
 - Camera not opening:
   - Check CAMERA_URLS reachability and stream availability.
@@ -153,9 +156,9 @@ If CLOUD_SYNC_ENABLED=1, payload includes:
   - Ensure ultralytics is installed in the active environment.
 
 - No ambulance override:
-  - Confirm bestamb.pt has an ambulance class label.
+  - Confirm models/new.pt has an ambulance class label.
   - Increase AMBULANCE_CONFIRM_SECONDS only if needed.
-  - Lower AMBULANCE_CONF_THRESHOLD if detections are too strict.
+  - Reduce FRAME_SKIP for faster ambulance response.
 
 - GPIO issues on Raspberry Pi:
   - Update lane pin mapping in raspberry_pi_server.py.

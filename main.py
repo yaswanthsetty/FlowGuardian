@@ -8,7 +8,6 @@ import cv2
 from communication.cloud_sync import CloudSyncClient
 from communication.socket_client import PersistentSocketClient
 from config import Settings, load_settings
-from detection.ambulance_detector import AmbulanceDetector
 from detection.yolo_detector import YoloTrafficDetector
 from logic.accident_ml import AccidentDetector
 from logic.traffic_scheduler import TrafficScheduler
@@ -40,11 +39,7 @@ class TrafficControllerApp:
         self.settings = settings
         self.logger = build_logger()
 
-        self.detector = YoloTrafficDetector(settings.model_path)
-        self.ambulance_detector = AmbulanceDetector(
-            model_path=settings.ambulance_model_path,
-            conf_threshold=settings.ambulance_conf_threshold,
-        )
+        self.detector = YoloTrafficDetector(settings.model_path, device=settings.device)
         self.accident_detector = AccidentDetector(
             model_path=settings.accident_model_path,
             conf_threshold=settings.accident_conf_threshold,
@@ -90,14 +85,14 @@ class TrafficControllerApp:
         self.latest_accident_boxes: List[list[tuple[int, int, int, int]]] = [[] for _ in self.cameras]
         self.latest_accident_confidence: List[float] = [0.0] * len(self.cameras)
         self.latest_vehicle_counts: List[int] = [0] * len(self.cameras)
-        self.latest_ambulance_boxes: List[list[tuple[int, int, int, int]]] = [[] for _ in self.cameras]
-        self.latest_ambulance_confidence: List[float] = [0.0] * len(self.cameras)
         self.latest_ambulance_detected: List[bool] = [False] * len(self.cameras)
 
         self.accident_active = False
         self.accident_lane: int | None = None
         self.running = True
         self.lock = threading.Lock()
+
+        self.logger.info(f"Primary model loaded on device: {self.detector.device}")
 
     def _update_accident_state(self, detected_accident_lanes: list[int], confidence: float) -> None:
         now = time.time()
@@ -176,14 +171,10 @@ class TrafficControllerApp:
             )
 
     def _draw_ambulance_overlay(self, frame: Any, camera_idx: int) -> None:
-        for x1, y1, x2, y2 in self.latest_ambulance_boxes[camera_idx]:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv2.putText(frame, "AMBULANCE", (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
         if self.latest_ambulance_detected[camera_idx]:
             cv2.putText(
                 frame,
-                f"AMBULANCE CANDIDATE (conf: {self.latest_ambulance_confidence[camera_idx]:.2f})",
+                "AMBULANCE DETECTED",
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -211,6 +202,8 @@ class TrafficControllerApp:
             self.logger.warning(f"Lane {idx + 1}: camera open failed ({cam.url})")
             return False
 
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         cam.cap = cap
         self.logger.info(f"Lane {idx + 1}: camera connected")
         return True
@@ -235,37 +228,31 @@ class TrafficControllerApp:
                     frame = cv2.resize(frame, (self.settings.frame_width, self.settings.frame_height))
                     self.frame_counts[idx] += 1
 
-                    try:
-                        result = self.detector.analyze_frame(frame)
-                    except Exception as exc:
-                        self.logger.exception(f"Lane {idx + 1}: inference error: {exc}")
-                        continue
-
-                    ambulance_detected = self.latest_ambulance_detected[idx]
-                    if self.frame_counts[idx] % self.settings.ambulance_frame_skip == 0:
-                        try:
-                            ambulance_data = self.ambulance_detector.detect(frame)
-                            ambulance_detected = bool(ambulance_data["detected"])
-                            self.latest_ambulance_detected[idx] = ambulance_detected
-                            self.latest_ambulance_confidence[idx] = float(ambulance_data["confidence"])
-                            self.latest_ambulance_boxes[idx] = ambulance_data["boxes"]
-                        except Exception as exc:
-                            self.logger.exception(f"Lane {idx + 1}: ambulance detection failure: {exc}")
-                            ambulance_detected = False
-                            self.latest_ambulance_detected[idx] = False
-                            self.latest_ambulance_confidence[idx] = 0.0
-                            self.latest_ambulance_boxes[idx] = []
-
-                    confirmed_lane = self.scheduler.update_lane_detection(
-                        lane_index=idx,
-                        vehicle_count=result.vehicle_count,
-                        ambulance_detected=ambulance_detected,
+                    should_run_primary = (
+                        self.frame_counts[idx] == 1
+                        or self.frame_counts[idx] % self.settings.frame_skip == 0
                     )
-                    self.latest_vehicle_counts[idx] = result.vehicle_count
 
-                    if confirmed_lane is not None:
-                        self.logger.warning(f"Ambulance confirmed in lane {confirmed_lane}")
-                        self.socket_client.send_with_retry(f"AMBULANCE:LANE{confirmed_lane}")
+                    result = None
+                    if should_run_primary:
+                        try:
+                            result = self.detector.analyze_frame(frame)
+                        except Exception as exc:
+                            self.logger.exception(f"Lane {idx + 1}: inference error: {exc}")
+                            continue
+
+                        self.latest_vehicle_counts[idx] = result.vehicle_count
+                        self.latest_ambulance_detected[idx] = result.ambulance_detected
+
+                        confirmed_lane = self.scheduler.update_lane_detection(
+                            lane_index=idx,
+                            vehicle_count=result.vehicle_count,
+                            ambulance_detected=result.ambulance_detected,
+                        )
+
+                        if confirmed_lane is not None:
+                            self.logger.warning(f"Ambulance confirmed in lane {confirmed_lane}")
+                            self.socket_client.send_with_retry(f"AMBULANCE:LANE{confirmed_lane}")
 
                     # Run accident detection every N frames to keep inference lightweight.
                     if self.frame_counts[idx] % self.settings.accident_frame_skip == 0:
@@ -315,10 +302,10 @@ class TrafficControllerApp:
                         )
 
                     if self.settings.show_windows:
-                        annotated = result.annotated_frame
+                        annotated = result.annotated_frame if result is not None else frame.copy()
                         cv2.putText(
                             annotated,
-                            f"Lane {idx + 1}: {result.vehicle_count} vehicles",
+                            f"Lane {idx + 1}: {self.latest_vehicle_counts[idx]} vehicles",
                             (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.7,
