@@ -65,9 +65,6 @@ class Settings:
     cloud_sync_enabled: bool
     cloud_sync_interval_seconds: int
     cloud_api_url: str
-    esp32_transport: str
-    esp32_endpoint: str
-    esp32_timeout_seconds: float
     junction_id: str
     show_windows: bool
 
@@ -123,9 +120,6 @@ def load_settings() -> Settings:
         cloud_sync_enabled=os.getenv("CLOUD_SYNC_ENABLED", "0") == "1",
         cloud_sync_interval_seconds=int(os.getenv("CLOUD_SYNC_INTERVAL_SECONDS", "10")),
         cloud_api_url=os.getenv("CLOUD_API_URL", ""),
-        esp32_transport=os.getenv("ESP32_TRANSPORT", "log").lower(),
-        esp32_endpoint=os.getenv("ESP32_ENDPOINT", ""),
-        esp32_timeout_seconds=float(os.getenv("ESP32_TIMEOUT_SECONDS", "2.0")),
         junction_id=os.getenv("JUNCTION_ID", "J1"),
         show_windows=os.getenv("SHOW_WINDOWS", "1") == "1",
     )

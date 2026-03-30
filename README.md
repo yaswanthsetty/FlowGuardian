@@ -35,7 +35,7 @@ Core objective:
   - Reason: ambulance or density
 
 ## Runtime Workflow
-Camera -> ML inference -> Scheduler -> JSON payload -> ESP32
+Camera -> ML inference -> Scheduler -> JSON payload -> Cloud -> ESP32
 
 Detailed flow:
 1. main.py reads config from .env via config.py.
@@ -47,8 +47,8 @@ Detailed flow:
    - Accident model runs periodically for monitoring overlays/alerts only.
 3. Scheduler returns mode + lane order + timings.
 4. Controller builds a compact JSON payload each scheduler cycle.
-5. JSON is sent using the configured ESP32 transport (log/http/socket).
-6. Optional cloud payload is sent on configured interval.
+5. JSON is sent to cloud on configured sync intervals.
+6. IoT devices (including ESP32) consume data from cloud.
 
 ## Raspberry Pi Communication
 Raspberry Pi support remains available but is optional.
@@ -57,8 +57,8 @@ Raspberry Pi support remains available but is optional.
 - Set ENABLE_PI=0 (default) to disable all Raspberry Pi connection attempts.
 - Existing Raspberry Pi parser behavior in raspberry_pi_server.py is unchanged.
 
-## ESP32 JSON Communication
-Each scheduler cycle produces JSON payload:
+## Cloud JSON Communication
+Each scheduler cycle produces JSON payload (cloud upload payload):
 
 ```json
 {
@@ -76,10 +76,10 @@ Each scheduler cycle produces JSON payload:
 }
 ```
 
-Transport configuration:
-- ESP32_TRANSPORT=log: placeholder mode, prints payload (safe default)
-- ESP32_TRANSPORT=http: POST JSON to ESP32_ENDPOINT URL
-- ESP32_TRANSPORT=socket: send JSON to ESP32_ENDPOINT in host:port format
+Cloud sync behavior:
+- Upload is controlled by CLOUD_SYNC_ENABLED and CLOUD_SYNC_INTERVAL_SECONDS.
+- Endpoint is configured through CLOUD_API_URL.
+- Runtime remains stable if cloud is unreachable (errors are logged, loop continues).
 
 ## Multi-Lane Support
 The system supports 3-lane, 4-lane, or N-lane setups.
@@ -125,15 +125,14 @@ Important keys:
 - PI_HOST=<raspberry_pi_ip>
 - PI_PORT=7000
 - ENABLE_PI=0
-- ESP32_TRANSPORT=log
-- ESP32_ENDPOINT=
-- ESP32_TIMEOUT_SECONDS=2.0
 - DEFAULT_GREEN_DURATIONS=20,20,20,20
 - DEFAULT_YELLOW_DURATIONS=5,5,5,5
 - DENSITY_OVERRIDE_THRESHOLD=15
 - TOTAL_OVERRIDE_CYCLE_TIME=80
 - AMBULANCE_CONFIRM_SECONDS=8
 - CLOUD_SYNC_ENABLED=0 or 1
+- CLOUD_SYNC_INTERVAL_SECONDS=10
+- CLOUD_API_URL=https://your-cloud-endpoint.example/api/signal
 
 ### 4. Place model files
 - new.pt under models/ (or set MODEL_PATH)
@@ -154,11 +153,9 @@ python3 raspberry_pi_server.py
 If CLOUD_SYNC_ENABLED=1, payload includes:
 - mode
 - reason
-- junction_id
-- lane_order
 - lanes[] with green/yellow/vehicle_count
-- ambulance_lane
-- accident_alert {active, lane, confidence}
+- ambulance {active, lane}
+- accident {active, lane, confidence}
 - timestamp
 
 ## Performance Optimizations
@@ -176,7 +173,7 @@ If CLOUD_SYNC_ENABLED=1, payload includes:
 
 - Socket send failures:
   - If using Raspberry Pi mode, ensure ENABLE_PI=1 and PI_HOST:PI_PORT is reachable.
-  - If using ESP32 http/socket mode, validate ESP32_TRANSPORT and ESP32_ENDPOINT.
+  - If cloud sync is enabled, validate CLOUD_API_URL reachability.
 
 - Model load errors:
   - Verify .pt files exist at configured paths.

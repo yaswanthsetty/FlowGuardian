@@ -1,13 +1,11 @@
 import datetime as dt
 import json
-import socket
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, List
 
 import cv2
-import requests
 
 from communication.cloud_sync import CloudSyncClient
 from communication.socket_client import PersistentSocketClient
@@ -62,47 +60,6 @@ def build_signal_json(
         },
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
-
-
-def send_to_esp32(
-    json_data: dict[str, Any],
-    logger: Any,
-    transport: str = "log",
-    endpoint: str = "",
-    timeout_seconds: float = 2.0,
-) -> bool:
-    payload_text = json.dumps(json_data, separators=(",", ":"))
-    selected_transport = (transport or "log").lower()
-
-    try:
-        if selected_transport == "http":
-            if not endpoint:
-                logger.warning("ESP32 transport=http but ESP32_ENDPOINT is empty")
-                return False
-            response = requests.post(
-                endpoint,
-                data=payload_text,
-                headers={"Content-Type": "application/json"},
-                timeout=timeout_seconds,
-            )
-            response.raise_for_status()
-            return True
-
-        if selected_transport == "socket":
-            if ":" not in endpoint:
-                logger.warning("ESP32 transport=socket requires ESP32_ENDPOINT like host:port")
-                return False
-            host, port_text = endpoint.rsplit(":", 1)
-            with socket.create_connection((host.strip(), int(port_text.strip())), timeout=timeout_seconds) as sock:
-                sock.sendall(payload_text.encode("utf-8"))
-            return True
-
-        # Default placeholder behavior for flexible integration (serial/other transports).
-        logger.info(f"ESP32 JSON payload: {payload_text}")
-        return True
-    except Exception as exc:
-        logger.warning(f"ESP32 send failed ({selected_transport}): {exc}")
-        return False
 
 
 def get_lane_from_bbox(bbox: tuple[int, int, int, int], frame_width: int, num_lanes: int) -> int:
@@ -456,29 +413,10 @@ class TrafficControllerApp:
                         accident_confidence=accident_confidence,
                     )
 
-                if self.cloud_sync.should_sync():
-                    payload = self.cloud_sync.build_payload(
-                        mode=schedule.mode,
-                        reason=schedule.reason,
-                        lane_order=schedule.lane_order,
-                        green_times=schedule.green_times,
-                        yellow_times=schedule.yellow_times,
-                        vehicle_counts=vehicle_counts,
-                        ambulance_lane=ambulance_lane,
-                        accident_active=self.accident_active,
-                        accident_lane=self.accident_lane,
-                        accident_confidence=accident_confidence,
-                    )
-                    self.cloud_sync.sync(payload)
-
                 self.logger.info(f"Signal JSON: {json.dumps(signal_json)}")
-                send_to_esp32(
-                    json_data=signal_json,
-                    logger=self.logger,
-                    transport=self.settings.esp32_transport,
-                    endpoint=self.settings.esp32_endpoint,
-                    timeout_seconds=self.settings.esp32_timeout_seconds,
-                )
+
+                if self.cloud_sync.should_sync():
+                    self.cloud_sync.sync(signal_json)
 
                 if self.socket_client is not None:
                     message = self.scheduler.to_wire_message(schedule)
