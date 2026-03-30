@@ -62,6 +62,35 @@ def build_signal_json(
     }
 
 
+def build_interval_signal_json(
+    mode: str,
+    reason: str,
+    active_lane: int,
+    green_time: int,
+    ambulance_active: bool,
+    ambulance_lane: int | None,
+    accident_active: bool,
+    accident_lane: int | None,
+    accident_confidence: float,
+) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "reason": reason,
+        "active_lane": int(active_lane),
+        "green": int(green_time),
+        "ambulance": {
+            "active": ambulance_active,
+            "lane": ambulance_lane,
+        },
+        "accident": {
+            "active": accident_active,
+            "lane": accident_lane,
+            "confidence": float(accident_confidence),
+        },
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
 def get_lane_from_bbox(bbox: tuple[int, int, int, int], frame_width: int, num_lanes: int) -> int:
     x1, _, x2, _ = bbox
     center_x = (x1 + x2) / 2.0
@@ -141,6 +170,7 @@ class TrafficControllerApp:
         self.lock = threading.Lock()
 
         self.logger.info(f"Primary model loaded on device: {self.detector.device}")
+        self.logger.info(f"Control mode: {self.settings.control_mode}")
 
     def _update_accident_state(self, detected_accident_lanes: list[int], confidence: float) -> None:
         now = time.time()
@@ -392,8 +422,54 @@ class TrafficControllerApp:
         )
         time.sleep(self.settings.initial_wait_seconds)
 
+        control_mode = self.settings.control_mode if self.settings.control_mode in {"cycle", "interval"} else "cycle"
+        next_interval_time = time.time()
+
         try:
             while self.running:
+                if control_mode == "interval":
+                    now = time.time()
+                    if now < next_interval_time:
+                        time.sleep(0.2)
+                        continue
+
+                    with self.lock:
+                        decision = self.scheduler.get_interval_decision(
+                            control_interval_seconds=self.settings.control_interval_seconds,
+                            min_green_time=self.settings.min_green_time,
+                            max_green_time=self.settings.max_green_time,
+                        )
+                        ambulance_lane = self.scheduler.ambulance_lane if self.scheduler.ambulance_active else None
+                        accident_confidence = max(self.latest_accident_confidence) if self.latest_accident_confidence else 0.0
+                        signal_json = build_interval_signal_json(
+                            mode=decision.mode,
+                            reason=decision.reason,
+                            active_lane=decision.active_lane,
+                            green_time=decision.green_time,
+                            ambulance_active=self.scheduler.ambulance_active,
+                            ambulance_lane=ambulance_lane,
+                            accident_active=self.accident_active,
+                            accident_lane=self.accident_lane,
+                            accident_confidence=accident_confidence,
+                        )
+
+                    self.logger.info(
+                        f"Interval update: lane={decision.active_lane}, green={decision.green_time}s, mode={decision.mode}, reason={decision.reason}"
+                    )
+                    self.logger.info(f"Signal JSON: {json.dumps(signal_json)}")
+
+                    if self.cloud_sync.should_sync():
+                        self.cloud_sync.sync(signal_json)
+
+                    if self.socket_client is not None:
+                        pi_message = f"LANE{decision.active_lane}:{decision.green_time}:0"
+                        sent = self.socket_client.send_with_retry(pi_message)
+                        if not sent:
+                            self.logger.error("Failed to send interval signal to Raspberry Pi")
+
+                    next_interval_time = now + self.settings.control_interval_seconds
+                    continue
+
                 with self.lock:
                     schedule = self.scheduler.next_cycle()
                     vehicle_counts = self.latest_vehicle_counts[:]

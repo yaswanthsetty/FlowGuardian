@@ -25,6 +25,14 @@ class ScheduleResult:
         ]
 
 
+@dataclass
+class IntervalDecision:
+    mode: str
+    reason: str
+    active_lane: int
+    green_time: int
+
+
 class TrafficScheduler:
     def __init__(
         self,
@@ -47,6 +55,7 @@ class TrafficScheduler:
         self.ambulance_detection_times = [0.0] * lane_count
         self.ambulance_active = False
         self.ambulance_lane: Optional[int] = None
+        self._normal_interval_index = 0
 
     @staticmethod
     def _expand(source: List[int], target_size: int, fallback: int) -> List[int]:
@@ -147,6 +156,31 @@ class TrafficScheduler:
             return self._build_override_schedule(reason="density")
 
         return self._normal_priority()
+
+    def get_interval_decision(
+        self,
+        control_interval_seconds: int,
+        min_green_time: int,
+        max_green_time: int,
+    ) -> IntervalDecision:
+        schedule = self.next_cycle()
+
+        bounded_green = max(min_green_time, min(control_interval_seconds, max_green_time))
+
+        if not schedule.lane_order:
+            active_lane = 1
+        elif schedule.mode == "NORMAL":
+            active_lane = schedule.lane_order[self._normal_interval_index % len(schedule.lane_order)]
+            self._normal_interval_index += 1
+        else:
+            active_lane = schedule.lane_order[0]
+
+        return IntervalDecision(
+            mode=schedule.mode,
+            reason=schedule.reason,
+            active_lane=active_lane,
+            green_time=bounded_green,
+        )
 
     @staticmethod
     def to_wire_message(schedule: ScheduleResult) -> str:

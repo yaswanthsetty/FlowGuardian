@@ -34,6 +34,25 @@ Core objective:
   - Green time is distributed proportionally using TOTAL_OVERRIDE_CYCLE_TIME.
   - Reason: ambulance or density
 
+## Experimental Feature: Interval-Based Control
+This branch adds an optional interrupt-style control loop for experimentation.
+
+- cycle mode (default):
+  - Existing long-duration schedule behavior is preserved.
+  - Scheduler returns full lane plans with per-lane green/yellow times.
+
+- interval mode (experimental):
+  - Scheduler is re-evaluated every CONTROL_INTERVAL_SECONDS.
+  - Only one active lane is selected per interval.
+  - Green duration is bounded by MIN_GREEN_TIME and MAX_GREEN_TIME.
+  - Ambulance and density changes can alter the next interval decision quickly.
+
+Configuration:
+- CONTROL_MODE=cycle or interval
+- CONTROL_INTERVAL_SECONDS=5
+- MIN_GREEN_TIME=5
+- MAX_GREEN_TIME=10
+
 ## Runtime Workflow
 Camera -> ML inference -> Scheduler -> JSON payload -> Cloud -> ESP32
 
@@ -46,9 +65,11 @@ Detailed flow:
    - Scheduler applies per-lane ambulance temporal validation.
    - Accident model runs periodically for monitoring overlays/alerts only.
 3. Scheduler returns mode + lane order + timings.
-4. Controller builds a compact JSON payload each scheduler cycle.
+4. Controller builds a compact JSON payload each scheduler update.
 5. JSON is sent to cloud on configured sync intervals.
 6. IoT devices (including ESP32) consume data from cloud.
+
+In interval mode, payload includes active_lane and green for the next short control window.
 
 ## Raspberry Pi Communication
 Raspberry Pi support remains available but is optional.
@@ -129,6 +150,10 @@ Important keys:
 - DEFAULT_YELLOW_DURATIONS=5,5,5,5
 - DENSITY_OVERRIDE_THRESHOLD=15
 - TOTAL_OVERRIDE_CYCLE_TIME=80
+- CONTROL_MODE=cycle
+- CONTROL_INTERVAL_SECONDS=5
+- MIN_GREEN_TIME=5
+- MAX_GREEN_TIME=10
 - AMBULANCE_CONFIRM_SECONDS=8
 - CLOUD_SYNC_ENABLED=0 or 1
 - CLOUD_SYNC_INTERVAL_SECONDS=10
