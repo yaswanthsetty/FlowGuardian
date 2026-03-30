@@ -35,7 +35,7 @@ Core objective:
   - Reason: ambulance or density
 
 ## Runtime Workflow
-Camera -> new.pt inference -> Scheduler -> Socket -> Raspberry Pi -> Traffic lights
+Camera -> ML inference -> Scheduler -> JSON payload -> ESP32
 
 Detailed flow:
 1. main.py reads config from .env via config.py.
@@ -46,18 +46,40 @@ Detailed flow:
    - Scheduler applies per-lane ambulance temporal validation.
    - Accident model runs periodically for monitoring overlays/alerts only.
 3. Scheduler returns mode + lane order + timings.
-4. Controller sends timing string to Raspberry Pi over TCP.
-5. Optional cloud payload is sent on configured interval.
+4. Controller builds a compact JSON payload each scheduler cycle.
+5. JSON is sent using the configured ESP32 transport (log/http/socket).
+6. Optional cloud payload is sent on configured interval.
 
 ## Raspberry Pi Communication
-Current control message format from runtime:
-- LANE1:20:5,LANE2:20:5,LANE3:20:5,LANE4:20:5
+Raspberry Pi support remains available but is optional.
 
-Each segment means:
-- LANE<id>:<green_seconds>:<yellow_seconds>
+- Set ENABLE_PI=1 to keep sending legacy socket strings to Raspberry Pi.
+- Set ENABLE_PI=0 (default) to disable all Raspberry Pi connection attempts.
+- Existing Raspberry Pi parser behavior in raspberry_pi_server.py is unchanged.
 
-Compatibility:
-- Raspberry Pi parser in raspberry_pi_server.py also accepts LANE1:20 format (yellow defaults to 5).
+## ESP32 JSON Communication
+Each scheduler cycle produces JSON payload:
+
+```json
+{
+  "mode": "OVERRIDE",
+  "reason": "density",
+  "lanes": [
+    {"lane": 2, "green": 28, "yellow": 5, "vehicle_count": 15},
+    {"lane": 1, "green": 22, "yellow": 5, "vehicle_count": 11},
+    {"lane": 3, "green": 16, "yellow": 5, "vehicle_count": 6},
+    {"lane": 4, "green": 14, "yellow": 5, "vehicle_count": 4}
+  ],
+  "ambulance": {"active": false, "lane": null},
+  "accident": {"active": true, "lane": 3, "confidence": 0.84},
+  "timestamp": "2026-03-30T10:20:30.123456+00:00"
+}
+```
+
+Transport configuration:
+- ESP32_TRANSPORT=log: placeholder mode, prints payload (safe default)
+- ESP32_TRANSPORT=http: POST JSON to ESP32_ENDPOINT URL
+- ESP32_TRANSPORT=socket: send JSON to ESP32_ENDPOINT in host:port format
 
 ## Multi-Lane Support
 The system supports 3-lane, 4-lane, or N-lane setups.
@@ -102,6 +124,10 @@ Important keys:
 - CAMERA_URLS=http://cam1/video,http://cam2/video,http://cam3/video
 - PI_HOST=<raspberry_pi_ip>
 - PI_PORT=7000
+- ENABLE_PI=0
+- ESP32_TRANSPORT=log
+- ESP32_ENDPOINT=
+- ESP32_TIMEOUT_SECONDS=2.0
 - DEFAULT_GREEN_DURATIONS=20,20,20,20
 - DEFAULT_YELLOW_DURATIONS=5,5,5,5
 - DENSITY_OVERRIDE_THRESHOLD=15
@@ -141,6 +167,7 @@ If CLOUD_SYNC_ENABLED=1, payload includes:
 - FRAME_SKIP controls how often primary YOLO inference runs (lower is more responsive, higher is lighter).
 - Accident inference has a separate ACCIDENT_FRAME_SKIP control.
 - Camera buffers are minimized to keep live streams smooth.
+- JSON payload creation/sending runs once per scheduler cycle, not per frame.
 
 ## Troubleshooting
 - Camera not opening:
@@ -148,8 +175,8 @@ If CLOUD_SYNC_ENABLED=1, payload includes:
   - Verify FRAME_WIDTH/FRAME_HEIGHT are supported by the stream.
 
 - Socket send failures:
-  - Ensure Raspberry Pi server is running on PI_HOST:PI_PORT.
-  - Check firewall and local network routing.
+  - If using Raspberry Pi mode, ensure ENABLE_PI=1 and PI_HOST:PI_PORT is reachable.
+  - If using ESP32 http/socket mode, validate ESP32_TRANSPORT and ESP32_ENDPOINT.
 
 - Model load errors:
   - Verify .pt files exist at configured paths.

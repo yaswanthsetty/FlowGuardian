@@ -1,9 +1,13 @@
+import datetime as dt
+import json
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, List
 
 import cv2
+import requests
 
 from communication.cloud_sync import CloudSyncClient
 from communication.socket_client import PersistentSocketClient
@@ -16,6 +20,89 @@ from utils.logger import build_logger
 
 ACCIDENT_CONFIRM_FRAMES = 3
 ACCIDENT_LOCK_DURATION = 10.0
+
+
+def build_signal_json(
+    mode: str,
+    reason: str,
+    lane_order: list[int],
+    green_times: list[int],
+    yellow_times: list[int],
+    vehicle_counts: list[int],
+    ambulance_active: bool,
+    ambulance_lane: int | None,
+    accident_active: bool,
+    accident_lane: int | None,
+    accident_confidence: float,
+) -> dict[str, Any]:
+    lanes = []
+    for lane, green, yellow in zip(lane_order, green_times, yellow_times):
+        count = vehicle_counts[lane - 1] if 0 <= lane - 1 < len(vehicle_counts) else 0
+        lanes.append(
+            {
+                "lane": lane,
+                "green": int(green),
+                "yellow": int(yellow),
+                "vehicle_count": int(count),
+            }
+        )
+
+    return {
+        "mode": mode,
+        "reason": reason,
+        "lanes": lanes,
+        "ambulance": {
+            "active": ambulance_active,
+            "lane": ambulance_lane,
+        },
+        "accident": {
+            "active": accident_active,
+            "lane": accident_lane,
+            "confidence": float(accident_confidence),
+        },
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def send_to_esp32(
+    json_data: dict[str, Any],
+    logger: Any,
+    transport: str = "log",
+    endpoint: str = "",
+    timeout_seconds: float = 2.0,
+) -> bool:
+    payload_text = json.dumps(json_data, separators=(",", ":"))
+    selected_transport = (transport or "log").lower()
+
+    try:
+        if selected_transport == "http":
+            if not endpoint:
+                logger.warning("ESP32 transport=http but ESP32_ENDPOINT is empty")
+                return False
+            response = requests.post(
+                endpoint,
+                data=payload_text,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            return True
+
+        if selected_transport == "socket":
+            if ":" not in endpoint:
+                logger.warning("ESP32 transport=socket requires ESP32_ENDPOINT like host:port")
+                return False
+            host, port_text = endpoint.rsplit(":", 1)
+            with socket.create_connection((host.strip(), int(port_text.strip())), timeout=timeout_seconds) as sock:
+                sock.sendall(payload_text.encode("utf-8"))
+            return True
+
+        # Default placeholder behavior for flexible integration (serial/other transports).
+        logger.info(f"ESP32 JSON payload: {payload_text}")
+        return True
+    except Exception as exc:
+        logger.warning(f"ESP32 send failed ({selected_transport}): {exc}")
+        return False
 
 
 def get_lane_from_bbox(bbox: tuple[int, int, int, int], frame_width: int, num_lanes: int) -> int:
@@ -52,14 +139,18 @@ class TrafficControllerApp:
             density_override_threshold=settings.density_override_threshold,
             total_override_cycle_time=settings.total_override_cycle_time,
         )
-        self.socket_client = PersistentSocketClient(
-            host=settings.pi_host,
-            port=settings.pi_port,
-            connect_timeout=settings.connect_timeout_seconds,
-            send_timeout=settings.send_timeout_seconds,
-            retry_seconds=settings.socket_retry_seconds,
-            logger=self.logger,
-        )
+        self.socket_client: PersistentSocketClient | None = None
+        if settings.enable_pi:
+            self.socket_client = PersistentSocketClient(
+                host=settings.pi_host,
+                port=settings.pi_port,
+                connect_timeout=settings.connect_timeout_seconds,
+                send_timeout=settings.send_timeout_seconds,
+                retry_seconds=settings.socket_retry_seconds,
+                logger=self.logger,
+            )
+        else:
+            self.logger.info("Raspberry Pi communication is disabled (ENABLE_PI=0)")
         self.cloud_sync = CloudSyncClient(
             enabled=settings.cloud_sync_enabled,
             api_url=settings.cloud_api_url,
@@ -252,7 +343,8 @@ class TrafficControllerApp:
 
                         if confirmed_lane is not None:
                             self.logger.warning(f"Ambulance confirmed in lane {confirmed_lane}")
-                            self.socket_client.send_with_retry(f"AMBULANCE:LANE{confirmed_lane}")
+                            if self.socket_client is not None:
+                                self.socket_client.send_with_retry(f"AMBULANCE:LANE{confirmed_lane}")
 
                     # Run accident detection every N frames to keep inference lightweight.
                     if self.frame_counts[idx] % self.settings.accident_frame_skip == 0:
@@ -347,10 +439,22 @@ class TrafficControllerApp:
             while self.running:
                 with self.lock:
                     schedule = self.scheduler.next_cycle()
-                    message = self.scheduler.to_wire_message(schedule)
                     vehicle_counts = self.latest_vehicle_counts[:]
                     ambulance_lane = self.scheduler.ambulance_lane if self.scheduler.ambulance_active else None
                     accident_confidence = max(self.latest_accident_confidence) if self.latest_accident_confidence else 0.0
+                    signal_json = build_signal_json(
+                        mode=schedule.mode,
+                        reason=schedule.reason,
+                        lane_order=schedule.lane_order,
+                        green_times=schedule.green_times,
+                        yellow_times=schedule.yellow_times,
+                        vehicle_counts=vehicle_counts,
+                        ambulance_active=self.scheduler.ambulance_active,
+                        ambulance_lane=ambulance_lane,
+                        accident_active=self.accident_active,
+                        accident_lane=self.accident_lane,
+                        accident_confidence=accident_confidence,
+                    )
 
                 if self.cloud_sync.should_sync():
                     payload = self.cloud_sync.build_payload(
@@ -367,10 +471,20 @@ class TrafficControllerApp:
                     )
                     self.cloud_sync.sync(payload)
 
-                self.logger.info(f"Signal plan: {message}")
-                sent = self.socket_client.send_with_retry(message)
-                if not sent:
-                    self.logger.error("Failed to send signal plan to Raspberry Pi")
+                self.logger.info(f"Signal JSON: {json.dumps(signal_json)}")
+                send_to_esp32(
+                    json_data=signal_json,
+                    logger=self.logger,
+                    transport=self.settings.esp32_transport,
+                    endpoint=self.settings.esp32_endpoint,
+                    timeout_seconds=self.settings.esp32_timeout_seconds,
+                )
+
+                if self.socket_client is not None:
+                    message = self.scheduler.to_wire_message(schedule)
+                    sent = self.socket_client.send_with_retry(message)
+                    if not sent:
+                        self.logger.error("Failed to send signal plan to Raspberry Pi")
 
                 sleep_for = self.scheduler.cycle_duration(schedule)
                 time.sleep(max(sleep_for, 1))
@@ -383,7 +497,8 @@ class TrafficControllerApp:
             self._shutdown()
 
     def _shutdown(self) -> None:
-        self.socket_client.close()
+        if self.socket_client is not None:
+            self.socket_client.close()
 
         for cam in self.cameras:
             if cam.cap is not None:
