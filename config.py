@@ -62,6 +62,10 @@ class Settings:
     default_yellow_durations: List[int]
     density_override_threshold: int
     total_override_cycle_time: int
+    control_mode: str
+    control_interval_seconds: int
+    min_green_time: int
+    max_green_time: int
     cloud_sync_enabled: bool
     cloud_sync_interval_seconds: int
     cloud_api_url: str
@@ -117,6 +121,10 @@ def load_settings() -> Settings:
         default_yellow_durations=default_yellow_durations,
         density_override_threshold=int(os.getenv("DENSITY_OVERRIDE_THRESHOLD", "15")),
         total_override_cycle_time=int(os.getenv("TOTAL_OVERRIDE_CYCLE_TIME", "80")),
+        control_mode=os.getenv("CONTROL_MODE", "cycle").strip().lower(),
+        control_interval_seconds=max(1, int(os.getenv("CONTROL_INTERVAL_SECONDS", "5"))),
+        min_green_time=max(1, int(os.getenv("MIN_GREEN_TIME", "5"))),
+        max_green_time=max(1, int(os.getenv("MAX_GREEN_TIME", "10"))),
         cloud_sync_enabled=os.getenv("CLOUD_SYNC_ENABLED", "0") == "1",
         cloud_sync_interval_seconds=int(os.getenv("CLOUD_SYNC_INTERVAL_SECONDS", "10")),
         cloud_api_url=os.getenv("CLOUD_API_URL", ""),
