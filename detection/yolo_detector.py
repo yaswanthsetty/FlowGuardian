@@ -13,8 +13,9 @@ class DetectionResult:
 
 
 class YoloTrafficDetector:
-    def __init__(self, model_path: str, device: str = "auto"):
+    def __init__(self, model_path: str, device: str = "auto", conf_threshold: float = 0.35):
         self.model = YOLO(model_path)
+        self.conf_threshold = max(0.0, min(conf_threshold, 1.0))
         requested = (device or "auto").lower()
         if requested == "auto":
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -37,6 +38,9 @@ class YoloTrafficDetector:
         boxes = results[0].boxes
         if boxes is not None:
             for box in boxes:
+                confidence = float(box.conf[0])
+                if confidence < self.conf_threshold:
+                    continue
                 cls_id = int(box.cls[0])
                 label = str(self.model.names[cls_id]).lower()
                 if "ambulance" in label:

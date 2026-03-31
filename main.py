@@ -12,7 +12,7 @@ from communication.socket_client import PersistentSocketClient
 from config import Settings, load_settings
 from detection.yolo_detector import YoloTrafficDetector
 from logic.accident_ml import AccidentDetector
-from logic.traffic_scheduler import TrafficScheduler
+from logic.traffic_scheduler import ScheduleResult, TrafficScheduler
 from utils.logger import build_logger
 
 
@@ -91,15 +91,6 @@ def build_interval_signal_json(
     }
 
 
-def get_lane_from_bbox(bbox: tuple[int, int, int, int], frame_width: int, num_lanes: int) -> int:
-    x1, _, x2, _ = bbox
-    center_x = (x1 + x2) / 2.0
-    lane_width = max(frame_width / max(num_lanes, 1), 1)
-    lane_index = int(center_x / lane_width)
-    lane_index = max(0, min(lane_index, num_lanes - 1))
-    return lane_index + 1
-
-
 @dataclass
 class CameraState:
     url: str
@@ -112,7 +103,11 @@ class TrafficControllerApp:
         self.settings = settings
         self.logger = build_logger()
 
-        self.detector = YoloTrafficDetector(settings.model_path, device=settings.device)
+        self.detector = YoloTrafficDetector(
+            settings.model_path,
+            device=settings.device,
+            conf_threshold=settings.primary_conf_threshold,
+        )
         self.accident_detector = AccidentDetector(
             model_path=settings.accident_model_path,
             conf_threshold=settings.accident_conf_threshold,
@@ -124,6 +119,13 @@ class TrafficControllerApp:
             ambulance_confirm_seconds=settings.ambulance_confirm_seconds,
             density_override_threshold=settings.density_override_threshold,
             total_override_cycle_time=settings.total_override_cycle_time,
+            ambulance_detection_threshold=settings.ambulance_detection_threshold,
+            ambulance_miss_threshold=settings.ambulance_miss_threshold,
+            fairness_wait_weight=settings.fairness_wait_weight,
+            max_consecutive_priority_cycles=settings.max_consecutive_priority_cycles,
+            override_min_green=settings.override_min_green_seconds,
+            override_max_green=settings.override_max_green_seconds,
+            emergency_green_seconds=settings.emergency_green_seconds,
         )
         self.socket_client: PersistentSocketClient | None = None
         if settings.enable_pi:
@@ -142,6 +144,10 @@ class TrafficControllerApp:
             api_url=settings.cloud_api_url,
             interval_seconds=settings.cloud_sync_interval_seconds,
             junction_id=settings.junction_id,
+            request_timeout_seconds=settings.cloud_request_timeout_seconds,
+            max_retries=settings.cloud_max_retries,
+            retry_backoff_seconds=settings.cloud_retry_backoff_seconds,
+            queue_size=settings.cloud_queue_size,
             logger=self.logger,
         )
 
@@ -168,6 +174,14 @@ class TrafficControllerApp:
         self.accident_lane: int | None = None
         self.running = True
         self.lock = threading.Lock()
+
+        self._last_logged_mode: str | None = None
+        self._last_logged_active_lane: int | None = None
+        self._last_logged_ambulance_active = False
+        self._last_logged_ambulance_lane: int | None = None
+
+        self._locked_normal_schedule: ScheduleResult | None = None
+        self._normal_lock_until = 0.0
 
         self.logger.info(f"Primary model loaded on device: {self.detector.device}")
         self.logger.info(f"Control mode: {self.settings.control_mode}")
@@ -260,6 +274,74 @@ class TrafficControllerApp:
                 2,
             )
 
+    def _apply_stale_decay(self, lane_index: int) -> None:
+        current = self.latest_vehicle_counts[lane_index]
+        decayed_count = int(round(current * self.settings.stale_decay_factor))
+        decayed_count = max(0, decayed_count)
+
+        self.latest_vehicle_counts[lane_index] = decayed_count
+        self.latest_ambulance_detected[lane_index] = False
+        self.scheduler.update_lane_detection(
+            lane_index=lane_index,
+            vehicle_count=decayed_count,
+            ambulance_detected=False,
+        )
+
+    @staticmethod
+    def _resolve_active_lane(signal_json: dict[str, Any]) -> int | None:
+        if signal_json.get("active_lane") is not None:
+            return int(signal_json["active_lane"])
+
+        lanes = signal_json.get("lanes")
+        if isinstance(lanes, list) and lanes:
+            first = lanes[0]
+            if isinstance(first, dict) and first.get("lane") is not None:
+                return int(first["lane"])
+
+        return None
+
+    def _log_signal_event(self, signal_json: dict[str, Any]) -> None:
+        if self.settings.full_signal_logging:
+            self.logger.info(f"Signal JSON: {json.dumps(signal_json)}")
+            return
+
+        mode = str(signal_json.get("mode", "UNKNOWN"))
+        reason = str(signal_json.get("reason", "unknown"))
+        active_lane = self._resolve_active_lane(signal_json)
+
+        ambulance = signal_json.get("ambulance")
+        if isinstance(ambulance, dict):
+            ambulance_active = bool(ambulance.get("active", False))
+            ambulance_lane = ambulance.get("lane")
+        else:
+            ambulance_active = False
+            ambulance_lane = None
+
+        changed = (
+            mode != self._last_logged_mode
+            or active_lane != self._last_logged_active_lane
+            or ambulance_active != self._last_logged_ambulance_active
+            or (ambulance_active and ambulance_lane != self._last_logged_ambulance_lane)
+        )
+
+        if changed:
+            self.logger.info(
+                "Signal update: "
+                f"mode={mode}, reason={reason}, active_lane={active_lane}, "
+                f"ambulance_active={ambulance_active}, ambulance_lane={ambulance_lane}"
+            )
+
+        if ambulance_active and (
+            not self._last_logged_ambulance_active
+            or ambulance_lane != self._last_logged_ambulance_lane
+        ):
+            self.logger.warning(f"Ambulance priority active on lane {ambulance_lane}")
+
+        self._last_logged_mode = mode
+        self._last_logged_active_lane = active_lane
+        self._last_logged_ambulance_active = ambulance_active
+        self._last_logged_ambulance_lane = ambulance_lane
+
     def _ensure_camera_open(self, idx: int) -> bool:
         cam = self.cameras[idx]
         now = time.time()
@@ -291,6 +373,7 @@ class TrafficControllerApp:
             with self.lock:
                 for idx, _ in enumerate(self.cameras):
                     if not self._ensure_camera_open(idx):
+                        self._apply_stale_decay(idx)
                         continue
 
                     cap = self.cameras[idx].cap
@@ -301,6 +384,7 @@ class TrafficControllerApp:
                         self.logger.warning(f"Lane {idx + 1}: frame read failed, reconnecting")
                         cap.release()
                         self.cameras[idx].cap = None
+                        self._apply_stale_decay(idx)
                         continue
 
                     frame = cv2.resize(frame, (self.settings.frame_width, self.settings.frame_height))
@@ -317,6 +401,7 @@ class TrafficControllerApp:
                             result = self.detector.analyze_frame(frame)
                         except Exception as exc:
                             self.logger.exception(f"Lane {idx + 1}: inference error: {exc}")
+                            self._apply_stale_decay(idx)
                             continue
 
                         self.latest_vehicle_counts[idx] = result.vehicle_count
@@ -354,14 +439,7 @@ class TrafficControllerApp:
                                         )
                                     )
 
-                                detected_accident_lanes = [
-                                    get_lane_from_bbox(
-                                        bbox=box,
-                                        frame_width=self.settings.frame_width,
-                                        num_lanes=len(self.cameras),
-                                    )
-                                    for box in scaled_boxes
-                                ]
+                                detected_accident_lanes = [idx + 1] * len(scaled_boxes)
                                 self.latest_accident_boxes[idx] = scaled_boxes
                                 self.latest_accident_confidence[idx] = float(accident_data["confidence"])
                             else:
@@ -412,6 +490,70 @@ class TrafficControllerApp:
                 self.running = False
                 break
 
+    def _should_preempt_cycle(self, schedule_mode: str, schedule_reason: str, first_lane: int | None) -> bool:
+        with self.lock:
+            if self.scheduler.ambulance_active:
+                if schedule_reason != "ambulance":
+                    return True
+                if first_lane is None:
+                    return True
+                return self.scheduler.ambulance_lane != first_lane
+
+            if schedule_mode == "OVERRIDE":
+                return False
+
+            return bool(self.scheduler.lane_counts) and (
+                max(self.scheduler.lane_counts) > self.settings.density_override_threshold
+            )
+
+    def _sleep_cycle_window(
+        self,
+        planned_seconds: int,
+        schedule_mode: str,
+        schedule_reason: str,
+        first_lane: int | None,
+    ) -> bool:
+        duration = max(planned_seconds, 1)
+        tick = max(self.settings.cycle_sleep_tick_seconds, 0.05)
+        end_time = time.time() + duration
+
+        while self.running:
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                return False
+
+            if self._should_preempt_cycle(schedule_mode, schedule_reason, first_lane):
+                self.logger.info("Cycle preempted early due to urgent override condition")
+                return True
+
+            time.sleep(min(tick, remaining))
+
+        return False
+
+    def _select_cycle_schedule(self, now: float) -> ScheduleResult:
+        with self.lock:
+            if self.scheduler.ambulance_active:
+                self._locked_normal_schedule = None
+                self._normal_lock_until = 0.0
+                return self.scheduler.next_cycle()
+
+            if (
+                self._locked_normal_schedule is not None
+                and now < self._normal_lock_until
+                and self._locked_normal_schedule.mode == "NORMAL"
+            ):
+                return self._locked_normal_schedule
+
+            schedule = self.scheduler.next_cycle()
+            if schedule.mode == "NORMAL" and self.settings.normal_decision_lock_seconds > 0:
+                self._locked_normal_schedule = schedule
+                self._normal_lock_until = now + self.settings.normal_decision_lock_seconds
+            else:
+                self._locked_normal_schedule = None
+                self._normal_lock_until = 0.0
+
+            return schedule
+
     def run(self) -> None:
         self.logger.info("Starting traffic controller")
         capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
@@ -453,10 +595,7 @@ class TrafficControllerApp:
                             accident_confidence=accident_confidence,
                         )
 
-                    self.logger.info(
-                        f"Interval update: lane={decision.active_lane}, green={decision.green_time}s, mode={decision.mode}, reason={decision.reason}"
-                    )
-                    self.logger.info(f"Signal JSON: {json.dumps(signal_json)}")
+                    self._log_signal_event(signal_json)
 
                     if self.cloud_sync.should_sync():
                         self.cloud_sync.sync(signal_json)
@@ -470,8 +609,10 @@ class TrafficControllerApp:
                     next_interval_time = now + self.settings.control_interval_seconds
                     continue
 
+                now = time.time()
+                schedule = self._select_cycle_schedule(now)
+
                 with self.lock:
-                    schedule = self.scheduler.next_cycle()
                     vehicle_counts = self.latest_vehicle_counts[:]
                     ambulance_lane = self.scheduler.ambulance_lane if self.scheduler.ambulance_active else None
                     accident_confidence = max(self.latest_accident_confidence) if self.latest_accident_confidence else 0.0
@@ -489,7 +630,7 @@ class TrafficControllerApp:
                         accident_confidence=accident_confidence,
                     )
 
-                self.logger.info(f"Signal JSON: {json.dumps(signal_json)}")
+                self._log_signal_event(signal_json)
 
                 if self.cloud_sync.should_sync():
                     self.cloud_sync.sync(signal_json)
@@ -500,8 +641,16 @@ class TrafficControllerApp:
                     if not sent:
                         self.logger.error("Failed to send signal plan to Raspberry Pi")
 
-                sleep_for = self.scheduler.cycle_duration(schedule)
-                time.sleep(max(sleep_for, 1))
+                preempted = self._sleep_cycle_window(
+                    planned_seconds=self.scheduler.cycle_duration(schedule),
+                    schedule_mode=schedule.mode,
+                    schedule_reason=schedule.reason,
+                    first_lane=schedule.lane_order[0] if schedule.lane_order else None,
+                )
+
+                if preempted:
+                    self._locked_normal_schedule = None
+                    self._normal_lock_until = 0.0
 
         except KeyboardInterrupt:
             self.logger.info("Stopping traffic controller")
@@ -511,6 +660,8 @@ class TrafficControllerApp:
             self._shutdown()
 
     def _shutdown(self) -> None:
+        self.cloud_sync.close()
+
         if self.socket_client is not None:
             self.socket_client.close()
 
