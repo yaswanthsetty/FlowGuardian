@@ -66,10 +66,16 @@ Detailed flow:
    - Accident model runs periodically for monitoring overlays/alerts only.
 3. Scheduler returns mode + lane order + timings.
 4. Controller builds a compact JSON payload each scheduler update.
-5. JSON is sent to cloud on configured sync intervals.
+5. JSON is enqueued for async cloud delivery on configured sync intervals.
 6. IoT devices (including ESP32) consume data from cloud.
 
 In interval mode, payload includes active_lane and green for the next short control window.
+
+## Async Cloud Architecture
+- Main control loop never blocks on cloud HTTP requests.
+- `CloudSyncClient` maintains a bounded in-memory queue and background worker thread.
+- Failed sends are replayed with exponential backoff up to `CLOUD_MAX_RETRIES`.
+- Queue growth is bounded by `CLOUD_QUEUE_SIZE`.
 
 ## Raspberry Pi Communication
 Raspberry Pi support remains available but is optional.
@@ -100,7 +106,7 @@ Each scheduler cycle produces JSON payload (cloud upload payload):
 Cloud sync behavior:
 - Upload is controlled by CLOUD_SYNC_ENABLED and CLOUD_SYNC_INTERVAL_SECONDS.
 - Endpoint is configured through CLOUD_API_URL.
-- Runtime remains stable if cloud is unreachable (errors are logged, loop continues).
+- Runtime remains stable if cloud is unreachable (errors are logged, retries/backoff are applied, loop continues).
 
 ## Multi-Lane Support
 The system supports 3-lane, 4-lane, or N-lane setups.
@@ -150,14 +156,29 @@ Important keys:
 - DEFAULT_YELLOW_DURATIONS=5,5,5,5
 - DENSITY_OVERRIDE_THRESHOLD=15
 - TOTAL_OVERRIDE_CYCLE_TIME=80
+- FAIRNESS_WAIT_WEIGHT=2.0
+- MAX_CONSECUTIVE_PRIORITY_CYCLES=2
+- OVERRIDE_MIN_GREEN_SECONDS=8
+- OVERRIDE_MAX_GREEN_SECONDS=40
+- EMERGENCY_GREEN_SECONDS=15
 - CONTROL_MODE=cycle
 - CONTROL_INTERVAL_SECONDS=5
+- CYCLE_SLEEP_TICK_SECONDS=0.2
+- NORMAL_DECISION_LOCK_SECONDS=10
 - MIN_GREEN_TIME=5
 - MAX_GREEN_TIME=10
 - AMBULANCE_CONFIRM_SECONDS=8
+- AMBULANCE_DETECTION_THRESHOLD=2
+- AMBULANCE_MISS_THRESHOLD=3
+- STALE_DECAY_FACTOR=0.5
 - CLOUD_SYNC_ENABLED=0 or 1
 - CLOUD_SYNC_INTERVAL_SECONDS=10
+- CLOUD_QUEUE_SIZE=50
+- CLOUD_REQUEST_TIMEOUT_SECONDS=5
+- CLOUD_MAX_RETRIES=2
+- CLOUD_BACKOFF_SECONDS=0.5
 - CLOUD_API_URL=https://your-cloud-endpoint.example/api/signal
+- FULL_SIGNAL_LOGGING=0 or 1
 
 ### 4. Place model files
 - new.pt under models/ (or set MODEL_PATH)
@@ -189,7 +210,16 @@ If CLOUD_SYNC_ENABLED=1, payload includes:
 - FRAME_SKIP controls how often primary YOLO inference runs (lower is more responsive, higher is lighter).
 - Accident inference has a separate ACCIDENT_FRAME_SKIP control.
 - Camera buffers are minimized to keep live streams smooth.
-- JSON payload creation/sending runs once per scheduler cycle, not per frame.
+- Cloud sending is asynchronous and decoupled from control timing.
+
+## Real-Time Stability Improvements
+- Ambulance detection uses hysteresis (`AMBULANCE_DETECTION_THRESHOLD`, `AMBULANCE_MISS_THRESHOLD`) to reduce flicker.
+- Stale vehicle counts decay using `STALE_DECAY_FACTOR` instead of dropping immediately to zero.
+- Cycle mode uses interruptible short ticks via `CYCLE_SLEEP_TICK_SECONDS` for faster override response.
+- Density override uses fairness-aware scoring (density + wait aging) and anti-starvation streak limits.
+- Emergency mode uses hard ambulance preemption with fixed guaranteed emergency green windows.
+- Normal plans can be held briefly with `NORMAL_DECISION_LOCK_SECONDS` to avoid excessive plan thrashing.
+- Event-based logging reduces runtime logging overhead; use `FULL_SIGNAL_LOGGING=1` for full payload logs.
 
 ## Troubleshooting
 - Camera not opening:

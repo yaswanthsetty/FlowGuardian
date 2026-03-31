@@ -45,3 +45,8 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+tempdocs/
+
+server/
+iot/
